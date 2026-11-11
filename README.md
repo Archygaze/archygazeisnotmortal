@@ -52,6 +52,10 @@ uv run archygazeisnotmortal
 - `/persona_reload` — Reload `persona.md` without restarting
 - `/memory_clear` — Wipe conversation memory in the current channel or DM
 - `/memory_clear_all` — Wipe all saved conversation memory across every channel and DM
+- `/teach <rule>` — Teach the bot a permanent style/behavior rule or correction
+- `/style_sync [channel] [limit]` — Scan recent messages from `OWNER_USER_IDS` to learn your texting voice
+- `/style_add <example>` — Manually save a short sample line of how you talk
+- `/style_list` / `/style_clear` — Inspect or clear saved voice samples and learned rules
 - `/bot_pause` / `/bot_resume` — Pause or resume auto-replies
 - `/bot_status` — Check active provider, fallback, and channels
 - `/ask <message>` — Send a one-off message to your persona in any channel

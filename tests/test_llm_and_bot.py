@@ -265,3 +265,105 @@ async def test_bot_health_server_responds_200(tmp_path: Path) -> None:
     finally:
         await bot.close()
 
+
+async def test_bot_learns_owner_style_and_feedback_rules(tmp_path: Path) -> None:
+    settings = _make_settings(
+        tmp_path,
+        debounce_seconds=0.05,
+        owner_user_ids=(123,),
+        learn_owner_style=True,
+    )
+    bot = PersonaBot(settings)
+    await bot.memory.init(settings.auto_reply_channel_ids)
+
+    try:
+        bot._connection.user = SimpleNamespace(id=999, name="Clone", display_name="Clone")  # type: ignore[attr-defined]
+        bot.llm.generate_reply = AsyncMock(return_value="gotcha lol")  # type: ignore[method-assign]
+
+        class DummyTyping:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                return False
+
+        general_channel = MagicMock()
+        general_channel.id = 888  # Not in auto_reply_channel_ids
+        general_channel.typing = MagicMock(return_value=DummyTyping())
+        general_channel.send = AsyncMock()
+
+        bot_channel = MagicMock()
+        bot_channel.id = 555  # In auto_reply_channel_ids
+        bot_channel.typing = MagicMock(return_value=DummyTyping())
+        bot_channel.send = AsyncMock()
+
+        owner = SimpleNamespace(id=123, bot=False, display_name="Owner")
+        friend = SimpleNamespace(id=456, bot=False, display_name="Friend")
+
+        # Owner chatting in non-auto-reply channel teaches style sample without replying
+        owner_general_msg = SimpleNamespace(
+            author=owner,
+            channel=general_channel,
+            type=discord.MessageType.default,
+            content="nah im listening to music rn",
+            attachments=[],
+            mentions=[],
+            reference=None,
+            reply=AsyncMock(),
+        )
+        # Friend chatting in non-auto-reply channel is NOT added to owner style samples
+        friend_general_msg = SimpleNamespace(
+            author=friend,
+            channel=general_channel,
+            type=discord.MessageType.default,
+            content="friend phrase should not learn",
+            attachments=[],
+            mentions=[],
+            reference=None,
+            reply=AsyncMock(),
+        )
+        # Owner correcting bot in allowed channel is captured as a persistent learned rule
+        owner_feedback_msg = SimpleNamespace(
+            author=owner,
+            channel=bot_channel,
+            type=discord.MessageType.default,
+            content="i told you im not using bad_laugh all the time",
+            attachments=[],
+            mentions=[],
+            reference=None,
+            reply=AsyncMock(),
+        )
+
+        await bot.on_message(owner_general_msg)  # type: ignore[arg-type]
+        await bot.on_message(friend_general_msg)  # type: ignore[arg-type]
+        await bot.on_message(owner_feedback_msg)  # type: ignore[arg-type]
+        await bot._debounce_tasks[555]
+
+        assert 888 not in bot._debounce_tasks
+        assert await bot.memory.get_style_samples() == ["nah im listening to music rn"]
+        assert await bot.memory.get_learned_rules() == [
+            "i told you im not using bad_laugh all the time"
+        ]
+
+        # Later friend message in bot channel receives BOTH learned samples and rules in prompt
+        friend_bot_msg = SimpleNamespace(
+            author=friend,
+            channel=bot_channel,
+            type=discord.MessageType.default,
+            content="wyd",
+            attachments=[],
+            mentions=[],
+            reference=None,
+            reply=AsyncMock(),
+        )
+        await bot.on_message(friend_bot_msg)  # type: ignore[arg-type]
+        await bot._debounce_tasks[555]
+
+        latest_system_prompt = bot.llm.generate_reply.await_args.kwargs["system_prompt"]
+        assert "LEARNED OWNER VOICE SAMPLES" in latest_system_prompt
+        assert "- nah im listening to music rn" in latest_system_prompt
+        assert "OWNER CORRECTIONS & LEARNED RULES" in latest_system_prompt
+        assert "- i told you im not using bad_laugh all the time" in latest_system_prompt
+    finally:
+        await bot.close()
+

@@ -4,6 +4,7 @@ import asyncio
 import logging
 import time
 from collections import defaultdict
+from collections.abc import Sequence
 
 import discord
 from discord import app_commands
@@ -11,7 +12,12 @@ from discord.ext import commands
 
 from archygazeisnotmortal.config import Settings
 from archygazeisnotmortal.llm import LLMClient
-from archygazeisnotmortal.memory import MemoryStore, format_messages_for_llm
+from archygazeisnotmortal.memory import (
+    MemoryStore,
+    clean_style_sample,
+    format_messages_for_llm,
+    is_owner_correction_feedback,
+)
 from archygazeisnotmortal.persona import load_persona
 
 logger = logging.getLogger(__name__)
@@ -166,7 +172,13 @@ class PersonaBot(commands.Bot):
             )
         return False
 
-    def _build_turn_system_prompt(self, user_id: int, display_name: str) -> str:
+    def _build_turn_system_prompt(
+        self,
+        user_id: int,
+        display_name: str,
+        style_samples: Sequence[str] = (),
+        learned_rules: Sequence[str] = (),
+    ) -> str:
         clean_name = (display_name or "User").strip()
         if user_id in self.settings.special_user_ids:
             target_tag = f"{clean_name} (special_person)"
@@ -183,8 +195,23 @@ class PersonaBot(commands.Bot):
             target_tag = clean_name
             target_role = "friend/member"
             role_note = "This is a regular friend/member (NOT special_person)."
-        return (
-            f"{self.system_prompt}\n\n"
+
+        sections = [self.system_prompt]
+        if style_samples:
+            sample_lines = "\n".join(f"- {s}" for s in style_samples)
+            sections.append(
+                "--- LEARNED OWNER VOICE SAMPLES ---\n"
+                "Real short Discord messages written by the owner. Mirror this exact texting rhythm, casing, slang, punctuation, and laugh words (do NOT treat unrelated facts here as current chat events):\n"
+                f"{sample_lines}"
+            )
+        if learned_rules:
+            rule_lines = "\n".join(f"- {r}" for r in learned_rules)
+            sections.append(
+                "--- OWNER CORRECTIONS & LEARNED RULES ---\n"
+                "Explicit feedback and rules taught by the owner (follow these strictly, overriding conflicting habits above):\n"
+                f"{rule_lines}"
+            )
+        sections.append(
             "--- CURRENT REPLY TARGET ---\n"
             f"You are replying specifically to the latest message from `[{target_tag}]` "
             f"(user_id: {user_id}, role: {target_role}).\n"
@@ -193,6 +220,7 @@ class PersonaBot(commands.Bot):
             f"Keep speakers strictly separate: NEVER treat `[{target_tag}]` as another speaker "
             f"or attribute another speaker's messages to `[{target_tag}]`."
         )
+        return "\n\n".join(sections)
 
     def _is_bot_mentioned_or_replied(self, message: discord.Message) -> bool:
         if self.user is None:
@@ -227,7 +255,41 @@ class PersonaBot(commands.Bot):
 
         return False
 
+    async def _maybe_learn_from_owner(self, message: discord.Message) -> None:
+        if not self.settings.learn_owner_style:
+            return
+        if message.author.bot:
+            return
+        if message.type not in (discord.MessageType.default, discord.MessageType.reply):
+            return
+        if isinstance(message.channel, discord.DMChannel):
+            return
+        if message.author.id not in self.settings.owner_user_ids:
+            return
+
+        raw_content = (message.content or "").strip()
+        if not raw_content:
+            return
+        if self.settings.ignore_prefix and raw_content.startswith(self.settings.ignore_prefix):
+            return
+
+        replied_to_bot = self._is_bot_mentioned_or_replied(message)
+        in_allowed_channel = await self.memory.is_channel_allowed(message.channel.id)
+        if (in_allowed_channel or replied_to_bot) and is_owner_correction_feedback(
+            raw_content, replied_to_bot=replied_to_bot
+        ):
+            clean_rule = " ".join(raw_content.split())
+            if len(clean_rule) <= 220:
+                await self.memory.add_learned_rule(clean_rule)
+            return
+
+        sample = clean_style_sample(raw_content, ignore_prefix=self.settings.ignore_prefix)
+        if sample:
+            await self.memory.add_style_sample(sample, source_channel_id=message.channel.id)
+
     async def on_message(self, message: discord.Message) -> None:
+        await self._maybe_learn_from_owner(message)
+
         if not await self._should_process_message(message):
             return
 
@@ -298,9 +360,13 @@ class PersonaBot(commands.Bot):
                 bot_names = (
                     (self.user.display_name, self.user.name) if self.user else ()
                 )
+                style_samples = await self.memory.get_style_samples(limit=20)
+                learned_rules = await self.memory.get_learned_rules(limit=20)
                 turn_system_prompt = self._build_turn_system_prompt(
                     user_id=trigger_msg.author.id,
                     display_name=trigger_msg.author.display_name,
+                    style_samples=style_samples,
+                    learned_rules=learned_rules,
                 )
 
                 async with trigger_msg.channel.typing():
@@ -515,14 +581,180 @@ class PersonaBot(commands.Bot):
                 if self.settings.memory_ttl_hours > 0
                 else "no auto-expiry"
             )
+            samples_count, rules_count = await self.memory.count_style_memory()
             await interaction.response.send_message(
                 (
                     f"**Status:** {'Paused' if paused else 'Active'}\n"
                     f"**Primary AI:** `{self.settings.ai_provider}` / `{self.settings.ai_model}`\n"
                     f"**Fallback AI:** `{fallback}`\n"
                     f"**Auto-reply channels:** {channel_text}\n"
-                    f"**Memory retention:** {self.settings.memory_window} msgs ({ttl_text})"
+                    f"**Memory retention:** {self.settings.memory_window} msgs ({ttl_text})\n"
+                    f"**Owner learning:** {samples_count} voice sample(s), {rules_count} rule(s) "
+                    f"(auto-learn: {'on' if self.settings.learn_owner_style else 'off'})"
                 ),
+                ephemeral=True,
+            )
+
+        @self.tree.command(
+            name="teach",
+            description="Teach the bot a permanent rule or correction about how to talk.",
+        )
+        @app_commands.describe(rule="Rule or correction (e.g. 'never say wkwk, use lol instead')")
+        async def teach(interaction: discord.Interaction, rule: str) -> None:
+            if not self._is_admin(interaction):
+                await interaction.response.send_message(
+                    "You are not authorized to run admin commands.", ephemeral=True
+                )
+                return
+            cleaned = " ".join(rule.split())
+            if not cleaned:
+                await interaction.response.send_message("Rule cannot be empty.", ephemeral=True)
+                return
+            if len(cleaned) > 220:
+                await interaction.response.send_message(
+                    "Please keep each rule under 220 characters.", ephemeral=True
+                )
+                return
+            await self.memory.add_learned_rule(cleaned)
+            await interaction.response.send_message(f"Learned rule: `{cleaned}`", ephemeral=True)
+
+        @self.tree.command(
+            name="style_add",
+            description="Save an example message showing how you naturally text.",
+        )
+        @app_commands.describe(example="Short example line in your real voice")
+        async def style_add(interaction: discord.Interaction, example: str) -> None:
+            if not self._is_admin(interaction):
+                await interaction.response.send_message(
+                    "You are not authorized to run admin commands.", ephemeral=True
+                )
+                return
+            cleaned = " ".join(example.split())
+            if len(cleaned) < 2 or len(cleaned) > 180:
+                await interaction.response.send_message(
+                    "Please keep style examples between 2 and 180 characters.", ephemeral=True
+                )
+                return
+            await self.memory.add_style_sample(cleaned, source_channel_id=interaction.channel_id)
+            await interaction.response.send_message(
+                f"Saved voice example: `{cleaned}`", ephemeral=True
+            )
+
+        @self.tree.command(
+            name="style_sync",
+            description="Scan recent messages sent by OWNER_USER_IDS in a channel to learn your style.",
+        )
+        @app_commands.describe(
+            channel="Channel to scan (defaults to current channel)",
+            limit="Recent channel messages to scan (10-200, default 100)",
+        )
+        async def style_sync(
+            interaction: discord.Interaction,
+            channel: discord.TextChannel | None = None,
+            limit: app_commands.Range[int, 10, 200] = 100,
+        ) -> None:
+            if not self._is_admin(interaction):
+                await interaction.response.send_message(
+                    "You are not authorized to run admin commands.", ephemeral=True
+                )
+                return
+            if not self.settings.owner_user_ids:
+                await interaction.response.send_message(
+                    "Set `OWNER_USER_IDS` in `.env` so the bot knows whose messages to learn from.",
+                    ephemeral=True,
+                )
+                return
+            target = channel or interaction.channel
+            if target is None or not hasattr(target, "history"):
+                await interaction.response.send_message(
+                    "Cannot read message history in this channel.", ephemeral=True
+                )
+                return
+            await interaction.response.defer(thinking=True, ephemeral=True)
+            try:
+                scanned = 0
+                candidates: list[str] = []
+                async for msg in target.history(limit=limit):  # type: ignore[union-attr]
+                    scanned += 1
+                    if msg.author.bot or msg.author.id not in self.settings.owner_user_ids:
+                        continue
+                    sample = clean_style_sample(
+                        msg.content, ignore_prefix=self.settings.ignore_prefix
+                    )
+                    if sample:
+                        candidates.append(sample)
+                added = 0
+                for sample in reversed(candidates):
+                    if await self.memory.add_style_sample(sample, source_channel_id=target.id):
+                        added += 1
+                total_samples, _ = await self.memory.count_style_memory()
+                await interaction.followup.send(
+                    f"Scanned {scanned} message(s) in <#{target.id}>; "
+                    f"learned {added} new voice sample(s) ({total_samples} total saved).",
+                    ephemeral=True,
+                )
+            except discord.Forbidden:
+                await interaction.followup.send(
+                    f"I don't have Read Message History permission in <#{target.id}>.",
+                    ephemeral=True,
+                )
+
+        @self.tree.command(
+            name="style_list",
+            description="Show saved owner voice samples and learned rules.",
+        )
+        async def style_list(interaction: discord.Interaction) -> None:
+            if not self._is_admin(interaction):
+                await interaction.response.send_message(
+                    "You are not authorized to run admin commands.", ephemeral=True
+                )
+                return
+            rules = await self.memory.get_learned_rules(limit=20)
+            samples = await self.memory.get_style_samples(limit=20)
+            if not rules and not samples:
+                await interaction.response.send_message(
+                    "No learned rules or voice samples saved yet. Try `/teach` or `/style_sync`.",
+                    ephemeral=True,
+                )
+                return
+            rules_block = "\n".join(f"- {r}" for r in rules) if rules else "_None yet_"
+            samples_block = "\n".join(f"- {s}" for s in samples) if samples else "_None yet_"
+            body = (
+                f"**Learned Rules ({len(rules)}):**\n{rules_block}\n\n"
+                f"**Voice Samples ({len(samples)} most recent):**\n{samples_block}"
+            )
+            if len(body) > 1950:
+                body = body[:1947] + "..."
+            await interaction.response.send_message(body, ephemeral=True)
+
+        @self.tree.command(
+            name="style_clear",
+            description="Clear saved owner voice samples and/or learned rules.",
+        )
+        @app_commands.choices(
+            target=[
+                app_commands.Choice(name="All (samples + rules)", value="all"),
+                app_commands.Choice(name="Voice samples only", value="samples"),
+                app_commands.Choice(name="Learned rules only", value="rules"),
+            ]
+        )
+        async def style_clear(
+            interaction: discord.Interaction,
+            target: str = "all",
+        ) -> None:
+            if not self._is_admin(interaction):
+                await interaction.response.send_message(
+                    "You are not authorized to run admin commands.", ephemeral=True
+                )
+                return
+            deleted_samples = (
+                await self.memory.clear_style_samples() if target in ("all", "samples") else 0
+            )
+            deleted_rules = (
+                await self.memory.clear_learned_rules() if target in ("all", "rules") else 0
+            )
+            await interaction.response.send_message(
+                f"Cleared {deleted_samples} voice sample(s) and {deleted_rules} learned rule(s).",
                 ephemeral=True,
             )
 
@@ -544,9 +776,13 @@ class PersonaBot(commands.Bot):
                         "content": f"[{speaker}]: {message.strip()}",
                     }
                 ]
+                style_samples = await self.memory.get_style_samples(limit=20)
+                learned_rules = await self.memory.get_learned_rules(limit=20)
                 turn_system_prompt = self._build_turn_system_prompt(
                     user_id=interaction.user.id,
                     display_name=interaction.user.display_name,
+                    style_samples=style_samples,
+                    learned_rules=learned_rules,
                 )
                 bot_names = (self.user.display_name, self.user.name) if self.user else ()
                 reply_text = await self.llm.generate_reply(

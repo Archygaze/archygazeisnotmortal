@@ -2,7 +2,13 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 import pytest
 
-from archygazeisnotmortal.memory import ChatMessage, MemoryStore, format_messages_for_llm
+from archygazeisnotmortal.memory import (
+    ChatMessage,
+    MemoryStore,
+    clean_style_sample,
+    format_messages_for_llm,
+    is_owner_correction_feedback,
+)
 
 
 async def test_memory_store_messages_and_window(tmp_path: Path) -> None:
@@ -109,6 +115,39 @@ async def test_memory_store_ttl_expiration_and_clear_all(tmp_path: Path) -> None
         # Allowed channels & pause state remain intact after wiping messages
         assert await store.list_allowed_channels() == [101]
         assert await store.is_paused() is True
+    finally:
+        await store.close()
+
+
+def test_clean_style_sample_and_feedback_detection() -> None:
+    assert clean_style_sample("// secret chat", ignore_prefix="//") is None
+    assert clean_style_sample("https://example.com") is None
+    assert clean_style_sample("<@123> yo nah thats wild <:fire:99>") == "yo nah thats wild :fire:"
+    assert clean_style_sample("i told you im not using lmao_word all the time") is None
+    assert is_owner_correction_feedback("i told you im not using lmao_word all the time") is True
+    assert is_owner_correction_feedback("stop being annoying", replied_to_bot=True) is True
+    assert is_owner_correction_feedback("just got back from the gym") is False
+
+
+async def test_memory_store_owner_style_and_rules_persist_across_memory_clear(tmp_path: Path) -> None:
+    store = MemoryStore(tmp_path / "style.db")
+    await store.init()
+    try:
+        assert await store.add_style_sample("probably at the gym rn", source_channel_id=10) is True
+        assert await store.add_style_sample("PROBABLY AT THE GYM RN", source_channel_id=10) is False
+        assert await store.add_learned_rule("never say slang_token") is True
+        assert await store.add_learned_rule("never say slang_token") is False
+
+        await store.add_message(channel_id=10, role="user", content="temp chat", author_id=1, author_name="Owner")
+        await store.clear_all_memory()
+
+        assert await store.get_style_samples() == ["PROBABLY AT THE GYM RN"]
+        assert await store.get_learned_rules() == ["never say slang_token"]
+        assert await store.count_style_memory() == (1, 1)
+
+        assert await store.clear_style_samples() == 1
+        assert await store.clear_learned_rules() == 1
+        assert await store.count_style_memory() == (0, 0)
     finally:
         await store.close()
 

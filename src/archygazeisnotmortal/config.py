@@ -81,6 +81,7 @@ class Settings:
     persona_content: str = ""
     health_port: int | None = None
     special_user_ids: tuple[int, ...] = ()
+    learn_owner_style: bool = True
 
     @classmethod
     def from_env(
@@ -185,6 +186,7 @@ class Settings:
             special_user_ids=parse_id_set(
                 os.getenv("SPECIAL_USER_IDS"), "SPECIAL_USER_IDS"
             ),
+            learn_owner_style=parse_bool(os.getenv("LEARN_OWNER_STYLE"), True),
         )
 
     def api_key_for(self, provider: str) -> str:

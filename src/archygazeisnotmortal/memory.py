@@ -2,11 +2,92 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import aiosqlite
+
+_MENTION_OR_CHANNEL_RE = re.compile(r"<(?:@!?|@&|#)\d+>")
+_CUSTOM_EMOJI_RE = re.compile(r"<a?:(\w+):\d+>")
+_URL_RE = re.compile(r"https?://\S+", re.IGNORECASE)
+
+_FEEDBACK_PHRASES = (
+    "i told you",
+    "dont use ",
+    "don't use ",
+    "not using ",
+    "dont say ",
+    "don't say ",
+    "stop saying ",
+    "stop using ",
+    "never say ",
+    "never use ",
+    "i dont use ",
+    "i don't use ",
+    "i dont say ",
+    "i don't say ",
+    "i never say ",
+    "i never use ",
+    "im not this ",
+    "i'm not this ",
+    "not how i talk",
+    "dont talk like",
+    "don't talk like",
+    "jangan pake ",
+    "jangan pakai ",
+    "jangan bilang ",
+    "gw ga pake ",
+    "gw gak pake ",
+    "gue ga pake ",
+    "gue gak pake ",
+    "aku ga pake ",
+    "aku gak pake ",
+    "ga pernah pake ",
+    "gak pernah pake ",
+)
+
+_REPLY_ONLY_FEEDBACK_PHRASES = (
+    "stop being ",
+    "dont be so ",
+    "don't be so ",
+    "talk like me",
+)
+
+
+def is_owner_correction_feedback(text: str, replied_to_bot: bool = False) -> bool:
+    """Detect explicit style/behavior feedback directed at the bot by its owner."""
+    lowered = " ".join(text.lower().split())
+    if not lowered or len(lowered) > 220:
+        return False
+    if any(phrase in lowered for phrase in _FEEDBACK_PHRASES):
+        return True
+    if replied_to_bot and any(phrase in lowered for phrase in _REPLY_ONLY_FEEDBACK_PHRASES):
+        return True
+    return False
+
+
+def clean_style_sample(raw_content: str, ignore_prefix: str = "//") -> str | None:
+    """Normalize a raw Discord message into a safe short texting-style sample."""
+    text = (raw_content or "").strip()
+    if not text:
+        return None
+    if ignore_prefix and text.startswith(ignore_prefix):
+        return None
+    if text.startswith(("/", "!")):
+        return None
+
+    text = _MENTION_OR_CHANNEL_RE.sub("", text)
+    text = _CUSTOM_EMOJI_RE.sub(r":\1:", text)
+    text = _URL_RE.sub("", text)
+    text = " ".join(text.split())
+
+    if len(text) < 4 or len(text) > 180:
+        return None
+    if is_owner_correction_feedback(text, replied_to_bot=False):
+        return None
+    return text
 
 
 @dataclass(frozen=True, slots=True)
@@ -110,6 +191,21 @@ class MemoryStore:
             CREATE TABLE IF NOT EXISTS bot_state (
                 key TEXT PRIMARY KEY,
                 value TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS owner_style_samples (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                normalized TEXT NOT NULL UNIQUE,
+                content TEXT NOT NULL,
+                source_channel_id INTEGER,
+                created_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS owner_learned_rules (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                normalized TEXT NOT NULL UNIQUE,
+                rule TEXT NOT NULL,
+                created_at TEXT NOT NULL
             );
             """
         )
@@ -310,4 +406,125 @@ class MemoryStore:
             ("1" if paused else "0",),
         )
         await self.conn.commit()
+
+    async def add_style_sample(
+        self,
+        content: str,
+        source_channel_id: int | None = None,
+        max_samples: int = 60,
+    ) -> bool:
+        cleaned = " ".join(content.split())
+        if not cleaned:
+            return False
+        normalized = cleaned.lower()
+        cur = await self.conn.execute(
+            "SELECT 1 FROM owner_style_samples WHERE normalized = ?", (normalized,)
+        )
+        is_new = (await cur.fetchone()) is None
+        now = datetime.now(UTC).isoformat(timespec="microseconds")
+        await self.conn.execute(
+            """
+            INSERT INTO owner_style_samples (normalized, content, source_channel_id, created_at)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(normalized) DO UPDATE SET
+                content = excluded.content,
+                source_channel_id = excluded.source_channel_id,
+                created_at = excluded.created_at
+            """,
+            (normalized, cleaned, source_channel_id, now),
+        )
+        await self.conn.execute(
+            """
+            DELETE FROM owner_style_samples
+            WHERE id NOT IN (
+                SELECT id FROM owner_style_samples
+                ORDER BY created_at DESC, id DESC
+                LIMIT ?
+            )
+            """,
+            (max_samples,),
+        )
+        await self.conn.commit()
+        return is_new
+
+    async def get_style_samples(self, limit: int = 20) -> list[str]:
+        cur = await self.conn.execute(
+            """
+            SELECT content FROM owner_style_samples
+            ORDER BY created_at DESC, id DESC
+            LIMIT ?
+            """,
+            (limit,),
+        )
+        rows = await cur.fetchall()
+        return [str(row["content"]) for row in reversed(rows)]
+
+    async def clear_style_samples(self) -> int:
+        cur = await self.conn.execute("DELETE FROM owner_style_samples")
+        deleted = cur.rowcount or 0
+        await self.conn.commit()
+        if deleted > 0:
+            await self.conn.execute("VACUUM")
+        return deleted
+
+    async def add_learned_rule(self, rule: str, max_rules: int = 30) -> bool:
+        cleaned = " ".join(rule.split())
+        if not cleaned:
+            return False
+        normalized = cleaned.lower()
+        cur = await self.conn.execute(
+            "SELECT 1 FROM owner_learned_rules WHERE normalized = ?", (normalized,)
+        )
+        is_new = (await cur.fetchone()) is None
+        now = datetime.now(UTC).isoformat(timespec="microseconds")
+        await self.conn.execute(
+            """
+            INSERT INTO owner_learned_rules (normalized, rule, created_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(normalized) DO UPDATE SET
+                rule = excluded.rule,
+                created_at = excluded.created_at
+            """,
+            (normalized, cleaned, now),
+        )
+        await self.conn.execute(
+            """
+            DELETE FROM owner_learned_rules
+            WHERE id NOT IN (
+                SELECT id FROM owner_learned_rules
+                ORDER BY created_at DESC, id DESC
+                LIMIT ?
+            )
+            """,
+            (max_rules,),
+        )
+        await self.conn.commit()
+        return is_new
+
+    async def get_learned_rules(self, limit: int = 20) -> list[str]:
+        cur = await self.conn.execute(
+            """
+            SELECT rule FROM owner_learned_rules
+            ORDER BY created_at DESC, id DESC
+            LIMIT ?
+            """,
+            (limit,),
+        )
+        rows = await cur.fetchall()
+        return [str(row["rule"]) for row in reversed(rows)]
+
+    async def clear_learned_rules(self) -> int:
+        cur = await self.conn.execute("DELETE FROM owner_learned_rules")
+        deleted = cur.rowcount or 0
+        await self.conn.commit()
+        if deleted > 0:
+            await self.conn.execute("VACUUM")
+        return deleted
+
+    async def count_style_memory(self) -> tuple[int, int]:
+        cur_s = await self.conn.execute("SELECT COUNT(*) FROM owner_style_samples")
+        samples_count = int((await cur_s.fetchone())[0])
+        cur_r = await self.conn.execute("SELECT COUNT(*) FROM owner_learned_rules")
+        rules_count = int((await cur_r.fetchone())[0])
+        return samples_count, rules_count
 
