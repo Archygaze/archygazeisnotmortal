@@ -166,6 +166,33 @@ class PersonaBot(commands.Bot):
             )
         return False
 
+    def _build_turn_system_prompt(self, user_id: int, display_name: str) -> str:
+        clean_name = (display_name or "User").strip()
+        if user_id in self.settings.special_user_ids:
+            target_tag = f"{clean_name} (special_person)"
+            target_role = "special_person"
+            role_note = "This is the owner's special person."
+        elif user_id in self.settings.owner_user_ids:
+            target_tag = f"{clean_name} (owner_irl)"
+            target_role = "owner_irl (the real human owner)"
+            role_note = (
+                "This is the real human owner talking in the chat (NOT special_person). "
+                "Do NOT give them special_person or romantic treatment."
+            )
+        else:
+            target_tag = clean_name
+            target_role = "friend/member"
+            role_note = "This is a regular friend/member (NOT special_person)."
+        return (
+            f"{self.system_prompt}\n\n"
+            "--- CURRENT REPLY TARGET ---\n"
+            f"You are replying specifically to the latest message from `[{target_tag}]` "
+            f"(user_id: {user_id}, role: {target_role}).\n"
+            f"{role_note}\n"
+            f"Keep speakers strictly separate: NEVER treat `[{target_tag}]` as another speaker "
+            f"or attribute another speaker's messages to `[{target_tag}]`."
+        )
+
     def _is_bot_mentioned_or_replied(self, message: discord.Message) -> bool:
         if self.user is None:
             return False
@@ -254,6 +281,7 @@ class PersonaBot(commands.Bot):
                 if remaining_cooldown > 0:
                     await asyncio.sleep(remaining_cooldown)
 
+                trigger_msg = self._latest_trigger_message.get(channel_id) or trigger_msg
                 recent = await self.memory.get_recent_messages(
                     channel_id=channel_id,
                     limit=self.settings.memory_window,
@@ -261,6 +289,7 @@ class PersonaBot(commands.Bot):
                 formatted = format_messages_for_llm(
                     recent,
                     special_user_ids=self.settings.special_user_ids,
+                    owner_user_ids=self.settings.owner_user_ids,
                 )
                 if not formatted or formatted[-1]["role"] != "user":
                     return
@@ -268,10 +297,14 @@ class PersonaBot(commands.Bot):
                 bot_names = (
                     (self.user.display_name, self.user.name) if self.user else ()
                 )
+                turn_system_prompt = self._build_turn_system_prompt(
+                    user_id=trigger_msg.author.id,
+                    display_name=trigger_msg.author.display_name,
+                )
 
                 async with trigger_msg.channel.typing():
                     reply_text = await self.llm.generate_reply(
-                        system_prompt=self.system_prompt,
+                        system_prompt=turn_system_prompt,
                         messages=formatted,
                         bot_names=bot_names,
                     )
@@ -502,15 +535,21 @@ class PersonaBot(commands.Bot):
                 speaker = interaction.user.display_name
                 if interaction.user.id in self.settings.special_user_ids:
                     speaker = f"{speaker} (special_person)"
+                elif interaction.user.id in self.settings.owner_user_ids:
+                    speaker = f"{speaker} (owner_irl)"
                 prompt_msg = [
                     {
                         "role": "user",
                         "content": f"[{speaker}]: {message.strip()}",
                     }
                 ]
+                turn_system_prompt = self._build_turn_system_prompt(
+                    user_id=interaction.user.id,
+                    display_name=interaction.user.display_name,
+                )
                 bot_names = (self.user.display_name, self.user.name) if self.user else ()
                 reply_text = await self.llm.generate_reply(
-                    system_prompt=self.system_prompt,
+                    system_prompt=turn_system_prompt,
                     messages=prompt_msg,
                     bot_names=bot_names,
                 )

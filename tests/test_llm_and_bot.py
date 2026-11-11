@@ -163,8 +163,85 @@ async def test_bot_auto_replies_and_coalesces_messages(tmp_path: Path) -> None:
         assert call_kwargs["messages"] == [
             {"role": "user", "content": "[Alex]: yo\n[Alex]: u hopping on?"}
         ]
+        assert "CURRENT REPLY TARGET" in call_kwargs["system_prompt"]
+        assert "`[Alex]` (user_id: 42, role: friend/member)" in call_kwargs["system_prompt"]
+        assert "NOT special_person" in call_kwargs["system_prompt"]
         msg1.reply.assert_not_awaited()
         msg2.reply.assert_awaited_once_with("yeah im down in 10", mention_author=False)
+    finally:
+        await bot.close()
+
+
+async def test_bot_disambiguates_special_person_and_owner_irl(tmp_path: Path) -> None:
+    settings = _make_settings(
+        tmp_path,
+        debounce_seconds=0.05,
+        owner_user_ids=(123,),
+        special_user_ids=(777,),
+    )
+    bot = PersonaBot(settings)
+    await bot.memory.init(settings.auto_reply_channel_ids)
+
+    try:
+        bot._connection.user = SimpleNamespace(id=999, name="archygaze", display_name="archygaze")  # type: ignore[attr-defined]
+        bot.llm.generate_reply = AsyncMock(return_value="bro stop narrating lol")  # type: ignore[method-assign]
+
+        class DummyTyping:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                return False
+
+        channel = MagicMock()
+        channel.id = 555
+        channel.typing = MagicMock(return_value=DummyTyping())
+        channel.send = AsyncMock()
+
+        special_author = SimpleNamespace(id=777, bot=False, display_name="belca")
+        owner_author = SimpleNamespace(id=123, bot=False, display_name="archy")
+
+        msg_special = SimpleNamespace(
+            author=special_author,
+            channel=channel,
+            type=discord.MessageType.default,
+            content="i love you",
+            attachments=[],
+            mentions=[],
+            reference=None,
+            reply=AsyncMock(),
+        )
+        msg_owner = SimpleNamespace(
+            author=owner_author,
+            channel=channel,
+            type=discord.MessageType.default,
+            content="he love you",
+            attachments=[],
+            mentions=[],
+            reference=None,
+            reply=AsyncMock(),
+        )
+
+        await bot.on_message(msg_special)  # type: ignore[arg-type]
+        await bot.on_message(msg_owner)  # type: ignore[arg-type]
+        await bot._debounce_tasks[555]
+
+        assert bot.llm.generate_reply.await_count == 1
+        call_kwargs = bot.llm.generate_reply.await_args.kwargs
+        assert call_kwargs["messages"] == [
+            {
+                "role": "user",
+                "content": "[belca (special_person)]: i love you\n[archy (owner_irl)]: he love you",
+            }
+        ]
+        assert "CURRENT REPLY TARGET" in call_kwargs["system_prompt"]
+        assert (
+            "`[archy (owner_irl)]` (user_id: 123, role: owner_irl (the real human owner))"
+            in call_kwargs["system_prompt"]
+        )
+        assert "NOT special_person" in call_kwargs["system_prompt"]
+        msg_special.reply.assert_not_awaited()
+        msg_owner.reply.assert_awaited_once_with("bro stop narrating lol", mention_author=False)
     finally:
         await bot.close()
 

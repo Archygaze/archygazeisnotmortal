@@ -23,10 +23,12 @@ class ChatMessage:
 def format_messages_for_llm(
     messages: list[ChatMessage],
     special_user_ids: tuple[int, ...] = (),
+    owner_user_ids: tuple[int, ...] = (),
 ) -> list[dict[str, str]]:
     """Convert stored Discord messages into alternating user/assistant chat turns."""
     turns: list[dict[str, str]] = []
     special_set = set(special_user_ids)
+    owner_set = set(owner_user_ids)
 
     for msg in messages:
         text = msg.content.strip()
@@ -43,6 +45,8 @@ def format_messages_for_llm(
             speaker = (msg.author_name or "User").strip()
             if msg.author_id is not None and msg.author_id in special_set:
                 speaker = f"{speaker} (special_person)"
+            elif msg.author_id is not None and msg.author_id in owner_set:
+                speaker = f"{speaker} (owner_irl)"
             line = f"[{speaker}]: {text}"
             if turns and turns[-1]["role"] == "user":
                 turns[-1]["content"] = f"{turns[-1]['content']}\n{line}"
