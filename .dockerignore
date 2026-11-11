@@ -1,0 +1,14 @@
+.git
+.venv
+.env
+persona.md
+data/
+__pycache__/
+*.pyc
+*.pyo
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+.pytest_cache/
+tests/

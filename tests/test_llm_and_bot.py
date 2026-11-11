@@ -1,0 +1,169 @@
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock
+
+import discord
+import pytest
+
+from archygazeisnotmortal.bot import PersonaBot, normalize_discord_content, split_discord_message
+from archygazeisnotmortal.config import Settings
+from archygazeisnotmortal.llm import LLMClient, strip_speaker_prefix
+
+
+def _make_settings(tmp_path: Path, **overrides: object) -> Settings:
+    persona = tmp_path / "persona.md"
+    persona.write_text("# Test Persona\n- Keep it short.", encoding="utf-8")
+    defaults: dict[str, object] = {
+        "discord_token": "fake_token",
+        "auto_reply_channel_ids": (555,),
+        "owner_user_ids": (123,),
+        "reply_on_mention": True,
+        "reply_in_dms": True,
+        "ignore_prefix": "//",
+        "debounce_seconds": 0.01,
+        "channel_cooldown_seconds": 0.0,
+        "memory_window": 10,
+        "ai_provider": "groq",
+        "ai_model": "llama-3.3-70b-versatile",
+        "groq_api_key": "fake_groq",
+        "gemini_api_key": "fake_gem",
+        "openrouter_api_key": "",
+        "openai_api_key": "",
+        "ollama_base_url": "http://localhost:11434/v1",
+        "openai_base_url": "",
+        "fallback_ai_provider": "gemini",
+        "fallback_ai_model": "gemini-3.8-flash",
+        "ai_temperature": 0.7,
+        "ai_max_tokens": 200,
+        "persona_file": persona,
+        "database_path": tmp_path / "memory.db",
+    }
+    defaults.update(overrides)
+    return Settings(**defaults)  # type: ignore[arg-type]
+
+
+def test_strip_speaker_prefix() -> None:
+    assert strip_speaker_prefix("[Me]: hey there", ("Kai",)) == "hey there"
+    assert strip_speaker_prefix("[Kai]: yeah for sure", ("Kai",)) == "yeah for sure"
+    assert strip_speaker_prefix("[Other]: leave untouched", ("Kai",)) == "[Other]: leave untouched"
+    assert strip_speaker_prefix("Note: keep colon", ("Kai",)) == "Note: keep colon"
+
+
+def test_split_discord_message_respects_limit() -> None:
+    text = ("word " * 500).strip()
+    chunks = split_discord_message(text, max_len=2000)
+    assert len(chunks) == 2
+    assert all(len(c) <= 2000 for c in chunks)
+    assert " ".join(chunks) == text
+
+
+def test_normalize_discord_content_replaces_mention_and_attachments() -> None:
+    msg = SimpleNamespace(
+        content="<@999> look at this",
+        attachments=[SimpleNamespace(filename="clip.png")],
+    )
+    normalized = normalize_discord_content(msg, bot_user_id=999, bot_name="Kai")  # type: ignore[arg-type]
+    assert normalized == "@Kai look at this\n[attached: clip.png]"
+
+
+async def test_llm_client_falls_back_on_primary_failure(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    settings = _make_settings(tmp_path)
+    client = LLMClient(settings)
+
+    async def fake_sleep(_: float) -> None:
+        return None
+
+    monkeypatch.setattr("archygazeisnotmortal.llm.asyncio.sleep", fake_sleep)
+
+    calls: list[str] = []
+
+    async def fake_call_spec(spec, system_prompt, messages):
+        calls.append(spec.provider)
+        if spec.provider == "groq":
+            raise RuntimeError("429 Rate Limit")
+        return "[Bot]: all good, fallback worked"
+
+    monkeypatch.setattr(client, "_call_spec", fake_call_spec)
+
+    reply = await client.generate_reply(
+        system_prompt="sys",
+        messages=[{"role": "user", "content": "[Alex]: hey"}],
+        bot_names=("Bot",),
+    )
+    assert calls == ["groq", "groq", "gemini"]
+    assert reply == "all good, fallback worked"
+    await client.close()
+
+
+async def test_bot_auto_replies_and_coalesces_messages(tmp_path: Path) -> None:
+    settings = _make_settings(tmp_path, debounce_seconds=0.05)
+    bot = PersonaBot(settings)
+    await bot.memory.init(settings.auto_reply_channel_ids)
+
+    try:
+        # Mock logged-in bot user and LLM response
+        bot._connection.user = SimpleNamespace(id=999, name="MyClone", display_name="MyClone")  # type: ignore[attr-defined]
+        bot.llm.generate_reply = AsyncMock(return_value="yeah im down in 10")  # type: ignore[method-assign]
+
+        class DummyTyping:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                return False
+
+        channel = MagicMock()
+        channel.id = 555
+        channel.typing = MagicMock(return_value=DummyTyping())
+        channel.send = AsyncMock()
+
+        author = SimpleNamespace(id=42, bot=False, display_name="Alex")
+        msg1 = SimpleNamespace(
+            author=author,
+            channel=channel,
+            type=discord.MessageType.default,
+            content="yo",
+            attachments=[],
+            mentions=[],
+            reference=None,
+            reply=AsyncMock(),
+        )
+        msg2 = SimpleNamespace(
+            author=author,
+            channel=channel,
+            type=discord.MessageType.default,
+            content="u hopping on?",
+            attachments=[],
+            mentions=[],
+            reference=None,
+            reply=AsyncMock(),
+        )
+        ignored_msg = SimpleNamespace(
+            author=author,
+            channel=channel,
+            type=discord.MessageType.default,
+            content="// ignore this",
+            attachments=[],
+            mentions=[],
+            reference=None,
+            reply=AsyncMock(),
+        )
+
+        await bot.on_message(msg1)  # type: ignore[arg-type]
+        await bot.on_message(msg2)  # type: ignore[arg-type]
+        await bot.on_message(ignored_msg)  # type: ignore[arg-type]
+
+        # Wait for debounce task to finish
+        await bot._debounce_tasks[555]
+
+        # Should coalesce msg1 + msg2 into ONE LLM call and reply to msg2
+        assert bot.llm.generate_reply.await_count == 1
+        call_kwargs = bot.llm.generate_reply.await_args.kwargs
+        assert call_kwargs["messages"] == [
+            {"role": "user", "content": "[Alex]: yo\n[Alex]: u hopping on?"}
+        ]
+        msg1.reply.assert_not_awaited()
+        msg2.reply.assert_awaited_once_with("yeah im down in 10", mention_author=False)
+    finally:
+        await bot.close()
+
