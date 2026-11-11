@@ -1,4 +1,5 @@
 from pathlib import Path
+import asyncio
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -164,6 +165,25 @@ async def test_bot_auto_replies_and_coalesces_messages(tmp_path: Path) -> None:
         ]
         msg1.reply.assert_not_awaited()
         msg2.reply.assert_awaited_once_with("yeah im down in 10", mention_author=False)
+    finally:
+        await bot.close()
+
+
+async def test_bot_health_server_responds_200(tmp_path: Path) -> None:
+    settings = _make_settings(tmp_path, health_port=0)
+    bot = PersonaBot(settings)
+    await bot._start_health_server(0)
+    try:
+        assert bot._health_server is not None
+        port = bot._health_server.sockets[0].getsockname()[1]
+        reader, writer = await asyncio.open_connection("127.0.0.1", port)
+        writer.write(b"GET /health HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        await writer.drain()
+        response = await reader.read(1024)
+        writer.close()
+        await writer.wait_closed()
+        assert b"200 OK" in response
+        assert response.endswith(b"\r\n\r\nok")
     finally:
         await bot.close()
 

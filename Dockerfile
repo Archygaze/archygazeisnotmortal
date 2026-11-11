@@ -15,3 +15,4 @@ COPY src ./src
 RUN uv sync --frozen --no-dev --no-editable && mkdir -p /app/data
 
 CMD ["uv", "run", "--no-sync", "archygazeisnotmortal"]
+

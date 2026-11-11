@@ -85,10 +85,43 @@ class PersonaBot(commands.Bot):
         self._active_tasks: set[asyncio.Task[None]] = set()
         self._latest_trigger_message: dict[int, discord.Message] = {}
         self._last_reply_at: dict[int, float] = {}
+        self._health_server: asyncio.Server | None = None
 
         self._register_slash_commands()
 
+    async def _handle_health_connection(
+        self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+    ) -> None:
+        try:
+            try:
+                await asyncio.wait_for(reader.read(1024), timeout=2.0)
+            except TimeoutError:
+                pass
+            writer.write(
+                b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n"
+                b"Content-Length: 2\r\nConnection: close\r\n\r\nok"
+            )
+            await writer.drain()
+        except OSError:
+            pass
+        finally:
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except OSError:
+                pass
+
+    async def _start_health_server(self, port: int) -> None:
+        self._health_server = await asyncio.start_server(
+            self._handle_health_connection,
+            host="0.0.0.0",
+            port=port,
+        )
+        logger.info("Healthcheck HTTP server listening on port %d.", port)
+
     async def setup_hook(self) -> None:
+        if self.settings.health_port is not None:
+            await self._start_health_server(self.settings.health_port)
         await self.memory.init(self.settings.auto_reply_channel_ids)
         synced = await self.tree.sync()
         logger.info("Synced %d slash command(s).", len(synced))
@@ -100,6 +133,10 @@ class PersonaBot(commands.Bot):
             await asyncio.gather(*self._active_tasks, return_exceptions=True)
         self._debounce_tasks.clear()
         self._active_tasks.clear()
+        if self._health_server is not None:
+            self._health_server.close()
+            await self._health_server.wait_closed()
+            self._health_server = None
         await self.llm.close()
         await self.memory.close()
         await super().close()

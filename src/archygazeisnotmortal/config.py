@@ -79,6 +79,7 @@ class Settings:
     database_path: Path
     memory_ttl_hours: float = 0.0
     persona_content: str = ""
+    health_port: int | None = None
 
     @classmethod
     def from_env(
@@ -141,6 +142,13 @@ class Settings:
         if ai_max_tokens < 1:
             raise ValueError("AI_MAX_TOKENS must be >= 1")
 
+        raw_port = (os.getenv("HEALTH_PORT") or os.getenv("PORT") or "").strip()
+        health_port: int | None = None
+        if raw_port:
+            if not raw_port.isdigit() or not (1 <= int(raw_port) <= 65535):
+                raise ValueError(f"PORT/HEALTH_PORT must be between 1 and 65535, got {raw_port!r}")
+            health_port = int(raw_port)
+
         return cls(
             discord_token=os.getenv("DISCORD_TOKEN", "").strip(),
             auto_reply_channel_ids=parse_id_set(
@@ -172,6 +180,7 @@ class Settings:
             database_path=database_path,
             memory_ttl_hours=memory_ttl_hours,
             persona_content=os.getenv("PERSONA_CONTENT", "").strip(),
+            health_port=health_port,
         )
 
     def api_key_for(self, provider: str) -> str:

@@ -64,5 +64,5 @@ GitHub stores your code (not a running Discord bot), so keep your repo **private
 
 1. **Private files stay local:** `.gitignore` excludes `.env`, `persona.md`, and `data/` (`*.db*`), so your tokens, persona, and conversation history are never pushed to GitHub.
 2. **Containerized build:** A `Dockerfile` is included for hosts like Railway, Fly.io, Koyeb, Render (Background Worker), or any Docker VPS.
-3. **Environment variables on your host:** Set `DISCORD_TOKEN`, `OWNER_USER_IDS`, `AI_PROVIDER`, your API key, `MEMORY_TTL_HOURS=24`, and `PERSONA_CONTENT` (your `persona.md` text) as hidden secrets on the host, and attach a persistent volume to `/app/data` if you want memory and `/channel_add` settings to survive restarts.
+3. **Environment variables on your host:** Set `DISCORD_TOKEN`, `OWNER_USER_IDS`, `AI_PROVIDER`, your API key, `MEMORY_TTL_HOURS=24`, and `PERSONA_CONTENT` (your `persona.md` text) as hidden secrets on the host, and attach a persistent volume to `/app/data` if you want memory and `/channel_add` settings to survive restarts. If your host injects `PORT` (e.g., Render/Koyeb web services), the bot automatically responds `200 OK` on `/` and `/health`.
 
