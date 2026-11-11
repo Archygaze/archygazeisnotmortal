@@ -62,9 +62,10 @@ def test_normalize_discord_content_replaces_mention_and_attachments() -> None:
     msg = SimpleNamespace(
         content="<@999> look at this",
         attachments=[SimpleNamespace(filename="clip.png")],
+        stickers=[SimpleNamespace(name="wave")],
     )
     normalized = normalize_discord_content(msg, bot_user_id=999, bot_name="Kai")  # type: ignore[arg-type]
-    assert normalized == "@Kai look at this\n[attached: clip.png]"
+    assert normalized == "@Kai look at this\n[attached: clip.png]\n[sticker: wave]"
 
 
 async def test_llm_client_falls_back_on_primary_failure(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -436,6 +437,104 @@ async def test_bot_shares_saved_links_attachments_and_song_links(
         assert reply_call.kwargs["mention_author"] is False
         assert len(reply_call.kwargs["files"]) == 1
         assert reply_call.kwargs["files"][0].filename == "meme_pic.png"
+    finally:
+        await bot.close()
+
+
+async def test_bot_replies_in_private_dms_even_when_guild_paused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings = _make_settings(
+        tmp_path,
+        debounce_seconds=0.05,
+        owner_user_ids=(123,),
+        special_user_ids=(777,),
+        reply_in_dms=True,
+    )
+    bot = PersonaBot(settings)
+    await bot.memory.init(settings.auto_reply_channel_ids)
+
+    try:
+        await bot.memory.set_paused(True)
+        bot._connection.user = SimpleNamespace(id=999, name="Clone", display_name="Clone")  # type: ignore[attr-defined]
+        bot.llm.generate_reply = AsyncMock(return_value="hey, missed you too")  # type: ignore[method-assign]
+
+        class DummyTyping:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                return False
+
+        # Subclass DMChannel just enough for isinstance(..., discord.DMChannel)
+        dm_channel = MagicMock(spec=discord.DMChannel)
+        dm_channel.id = 9001
+        dm_channel.typing = MagicMock(return_value=DummyTyping())
+        dm_channel.send = AsyncMock()
+
+        special_user = SimpleNamespace(id=777, bot=False, display_name="belca")
+        dm_msg = SimpleNamespace(
+            author=special_user,
+            channel=dm_channel,
+            type=discord.MessageType.default,
+            content="miss u",
+            attachments=[],
+            mentions=[],
+            reference=None,
+            reply=AsyncMock(),
+        )
+
+        await bot.on_message(dm_msg)  # type: ignore[arg-type]
+        await bot._debounce_tasks[9001]
+
+        assert bot.llm.generate_reply.await_count == 1
+        sys_prompt = bot.llm.generate_reply.await_args.kwargs["system_prompt"]
+        assert "Private 1-on-1 Discord DM" in sys_prompt
+        assert "[belca (special_person)]" in sys_prompt
+        dm_msg.reply.assert_not_awaited()
+        dm_channel.send.assert_awaited_once_with("hey, missed you too")
+
+        # Owner correcting the bot inside a DM learns a rule without polluting voice samples
+        owner_dm = MagicMock(spec=discord.DMChannel)
+        owner_dm.id = 9002
+        owner_dm.typing = MagicMock(return_value=DummyTyping())
+        owner_dm.send = AsyncMock()
+        owner_user = SimpleNamespace(id=123, bot=False, display_name="archy")
+        owner_msg = SimpleNamespace(
+            author=owner_user,
+            channel=owner_dm,
+            type=discord.MessageType.default,
+            content="stop being so stiff in DMs",
+            attachments=[],
+            mentions=[],
+            reference=None,
+            reply=AsyncMock(),
+        )
+        await bot.on_message(owner_msg)  # type: ignore[arg-type]
+        await bot._debounce_tasks[9002]
+        assert await bot.memory.get_learned_rules() == ["stop being so stiff in DMs"]
+        assert await bot.memory.get_style_samples() == []
+    finally:
+        await bot.close()
+
+
+async def test_bot_ignores_dms_when_reply_in_dms_disabled(tmp_path: Path) -> None:
+    settings = _make_settings(tmp_path, reply_in_dms=False)
+    bot = PersonaBot(settings)
+    await bot.memory.init(settings.auto_reply_channel_ids)
+    try:
+        dm_channel = MagicMock(spec=discord.DMChannel)
+        dm_channel.id = 9003
+        dm_msg = SimpleNamespace(
+            author=SimpleNamespace(id=42, bot=False, display_name="Friend"),
+            channel=dm_channel,
+            type=discord.MessageType.default,
+            content="hello",
+            attachments=[],
+            mentions=[],
+            reference=None,
+        )
+        assert await bot._should_process_message(dm_msg) is False  # type: ignore[arg-type]
     finally:
         await bot.close()
 

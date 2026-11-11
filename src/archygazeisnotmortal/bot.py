@@ -61,6 +61,16 @@ def split_discord_message(text: str, max_len: int = DISCORD_MAX_MESSAGE_LEN) -> 
     return chunks
 
 
+def _is_dm_channel(channel: object) -> bool:
+    if isinstance(channel, discord.DMChannel):
+        return True
+    return (
+        isinstance(channel, discord.PartialMessageable)
+        and channel.guild_id is None
+        and channel.type in (None, discord.ChannelType.private)
+    )
+
+
 def normalize_discord_content(
     message: discord.Message, bot_user_id: int | None, bot_name: str
 ) -> str:
@@ -72,6 +82,12 @@ def normalize_discord_content(
     if message.attachments:
         attachment_notes = ", ".join(att.filename for att in message.attachments[:5])
         suffix = f"[attached: {attachment_notes}]"
+        content = f"{content}\n{suffix}".strip() if content.strip() else suffix
+
+    stickers = getattr(message, "stickers", None) or ()
+    if stickers:
+        sticker_notes = ", ".join(s.name for s in stickers[:3])
+        suffix = f"[sticker: {sticker_notes}]"
         content = f"{content}\n{suffix}".strip() if content.strip() else suffix
 
     return content.strip()
@@ -160,12 +176,13 @@ class PersonaBot(commands.Bot):
     async def on_ready(self) -> None:
         active_channels = await self.memory.list_allowed_channels()
         logger.info(
-            "Logged in as %s (ID: %s) | Provider: %s/%s | Auto-reply channels: %s",
+            "Logged in as %s (ID: %s) | Provider: %s/%s | Auto-reply channels: %s | DMs: %s",
             self.user,
             self.user.id if self.user else "?",
             self.settings.ai_provider,
             self.settings.ai_model,
             active_channels or "none yet (use /channel_add in Discord)",
+            "enabled" if self.settings.reply_in_dms else "disabled",
         )
         if not self.settings.owner_user_ids:
             logger.warning(
@@ -190,6 +207,7 @@ class PersonaBot(commands.Bot):
         learned_rules: Sequence[str] = (),
         saved_items: Sequence[SavedShareItem] = (),
         latest_text: str = "",
+        is_dm: bool = False,
     ) -> str:
         clean_name = (display_name or "User").strip()
         if user_id in self.settings.special_user_ids:
@@ -255,10 +273,16 @@ class PersonaBot(commands.Bot):
             if detected_lang
             else f"Match the exact language of `[{target_tag}]`'s latest message (e.g., if they just wrote in English, reply in English; if Indonesian, reply in Indonesian), even if earlier messages used a different language."
         )
+        dm_note = (
+            f"Chat context: Private 1-on-1 Discord DM with `[{target_tag}]` (nobody else is in this chat). Still remember not to share real IRL secrets or generate NSFW/explicit content.\n"
+            if is_dm
+            else ""
+        )
         sections.append(
             "--- CURRENT REPLY TARGET ---\n"
             f"You are replying specifically to the latest message from `[{target_tag}]` "
             f"(user_id: {user_id}, role: {target_role}).\n"
+            f"{dm_note}"
             f"{role_note}\n"
             f"{lang_instruction}\n"
             f"Keep speakers strictly separate: NEVER treat `[{target_tag}]` as another speaker "
@@ -284,7 +308,7 @@ class PersonaBot(commands.Bot):
         if self.settings.ignore_prefix and message.content.startswith(self.settings.ignore_prefix):
             return False
 
-        is_dm = isinstance(message.channel, discord.DMChannel)
+        is_dm = _is_dm_channel(message.channel)
         if is_dm:
             return self.settings.reply_in_dms
 
@@ -306,8 +330,6 @@ class PersonaBot(commands.Bot):
             return
         if message.type not in (discord.MessageType.default, discord.MessageType.reply):
             return
-        if isinstance(message.channel, discord.DMChannel):
-            return
         if message.author.id not in self.settings.owner_user_ids:
             return
 
@@ -317,14 +339,20 @@ class PersonaBot(commands.Bot):
         if self.settings.ignore_prefix and raw_content.startswith(self.settings.ignore_prefix):
             return
 
-        replied_to_bot = self._is_bot_mentioned_or_replied(message)
-        in_allowed_channel = await self.memory.is_channel_allowed(message.channel.id)
+        is_dm = _is_dm_channel(message.channel)
+        replied_to_bot = is_dm or self._is_bot_mentioned_or_replied(message)
+        in_allowed_channel = (
+            False if is_dm else await self.memory.is_channel_allowed(message.channel.id)
+        )
         if (in_allowed_channel or replied_to_bot) and is_owner_correction_feedback(
             raw_content, replied_to_bot=replied_to_bot
         ):
             clean_rule = " ".join(raw_content.split())
             if len(clean_rule) <= 220:
                 await self.memory.add_learned_rule(clean_rule)
+            return
+
+        if is_dm:
             return
 
         sample = clean_style_sample(raw_content, ignore_prefix=self.settings.ignore_prefix)
@@ -379,7 +407,7 @@ class PersonaBot(commands.Bot):
                 return
 
             async with self._channel_locks[channel_id]:
-                is_dm = isinstance(trigger_msg.channel, discord.DMChannel)
+                is_dm = _is_dm_channel(trigger_msg.channel)
                 if not is_dm and await self.memory.is_paused():
                     return
 
@@ -389,6 +417,7 @@ class PersonaBot(commands.Bot):
                     await asyncio.sleep(remaining_cooldown)
 
                 trigger_msg = self._latest_trigger_message.get(channel_id) or trigger_msg
+                is_dm = _is_dm_channel(trigger_msg.channel)
                 recent = await self.memory.get_recent_messages(
                     channel_id=channel_id,
                     limit=self.settings.memory_window,
@@ -414,6 +443,7 @@ class PersonaBot(commands.Bot):
                     learned_rules=learned_rules,
                     saved_items=saved_items,
                     latest_text=trigger_msg.content or "",
+                    is_dm=is_dm,
                 )
 
                 async with trigger_msg.channel.typing():
@@ -499,6 +529,13 @@ class PersonaBot(commands.Bot):
             if target is None:
                 await interaction.response.send_message("No channel found.", ephemeral=True)
                 return
+            if _is_dm_channel(target):
+                dm_state = "enabled" if self.settings.reply_in_dms else "disabled"
+                await interaction.response.send_message(
+                    f"DMs don't need `/channel_add` (DM replies are currently `{dm_state}` via `REPLY_IN_DMS`). Pick a server channel instead.",
+                    ephemeral=True,
+                )
+                return
             added = await self.memory.add_allowed_channel(
                 target.id, added_by=interaction.user.id
             )
@@ -523,6 +560,13 @@ class PersonaBot(commands.Bot):
             target = channel or interaction.channel
             if target is None:
                 await interaction.response.send_message("No channel found.", ephemeral=True)
+                return
+            if _is_dm_channel(target):
+                dm_state = "enabled" if self.settings.reply_in_dms else "disabled"
+                await interaction.response.send_message(
+                    f"DMs don't use `/channel_remove` (DM replies are currently `{dm_state}` via `REPLY_IN_DMS`). Pick a server channel instead.",
+                    ephemeral=True,
+                )
                 return
             removed = await self.memory.remove_allowed_channel(target.id)
             msg = (
@@ -585,7 +629,7 @@ class PersonaBot(commands.Bot):
             description="Clear saved conversation memory in this channel or DM.",
         )
         async def memory_clear(interaction: discord.Interaction) -> None:
-            is_dm = isinstance(interaction.channel, discord.DMChannel)
+            is_dm = _is_dm_channel(interaction.channel)
             if not is_dm and not self._is_admin(interaction):
                 await interaction.response.send_message(
                     "You are not authorized to run admin commands.", ephemeral=True
@@ -665,7 +709,8 @@ class PersonaBot(commands.Bot):
             samples_count, rules_count = await self.memory.count_style_memory()
             await interaction.response.send_message(
                 (
-                    f"**Status:** {'Paused' if paused else 'Active'}\n"
+                    f"**Status:** {'Paused (server channels)' if paused else 'Active'}\n"
+                    f"**Direct Messages (DMs):** {'Enabled' if self.settings.reply_in_dms else 'Disabled'}\n"
                     f"**Primary AI:** `{self.settings.ai_provider}` / `{self.settings.ai_model}`\n"
                     f"**Fallback AI:** `{fallback}`\n"
                     f"**Auto-reply channels:** {channel_text}\n"
@@ -998,6 +1043,7 @@ class PersonaBot(commands.Bot):
                     learned_rules=learned_rules,
                     saved_items=saved_items,
                     latest_text=message.strip(),
+                    is_dm=_is_dm_channel(interaction.channel),
                 )
                 bot_names = (self.user.display_name, self.user.name) if self.user else ()
                 raw_reply = await self.llm.generate_reply(

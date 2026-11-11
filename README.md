@@ -3,7 +3,7 @@
 An async Python (`discord.py`) text bot that represents **you** in designated Discord channels — with an editable persona profile (`persona.md`), persistent SQLite conversation memory, message debouncing/batching, and multi-provider free AI support.
 
 ## Features
-- **Auto-replies in designated channels** (configured via `.env` or live in Discord with `/channel_add` & `/channel_remove`)
+- **Auto-replies in designated channels & Private DMs** (server channels via `/channel_add` & `/channel_remove`; 1-on-1 DMs controlled by `REPLY_IN_DMS=true`)
 - **Persona profile (`persona.md`)** with bio, texting tone, rules, boundaries, and example conversations — hot-reloadable via `/persona_reload`
 - **Persistent SQLite memory (`data/memory.db`)** per channel/DM with multi-speaker awareness (`[Alex]: ...`)
 - **Message debouncing & cooldowns** so rapid consecutive messages (`"yo"`, `"u there?"`, `"hop on"`) combine into one natural reply without wasting free API quota
@@ -63,6 +63,8 @@ uv run archygazeisnotmortal
 - `/ask <message>` — Send a one-off message to your persona in any channel
 
 > **Prefix tip:** Messages starting with `//` (configurable via `IGNORE_PREFIX`) are ignored by the bot so you can chat in an auto-reply channel without triggering it.
+>
+> **DM tip:** With `REPLY_IN_DMS=true` (enabled by default), anyone who shares a server with the bot and allows server Direct Messages in Discord privacy settings can DM the bot privately — each DM thread keeps its own separate conversation memory.
 
 ## 24/7 Private Deployment
 
