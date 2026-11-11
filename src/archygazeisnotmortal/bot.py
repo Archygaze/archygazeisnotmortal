@@ -189,6 +189,7 @@ class PersonaBot(commands.Bot):
             f"You are replying specifically to the latest message from `[{target_tag}]` "
             f"(user_id: {user_id}, role: {target_role}).\n"
             f"{role_note}\n"
+            f"Match the exact language of `[{target_tag}]`'s latest message (e.g., if they just wrote in English, reply in English; if Indonesian, reply in Indonesian), even if earlier messages used a different language.\n"
             f"Keep speakers strictly separate: NEVER treat `[{target_tag}]` as another speaker "
             f"or attribute another speaker's messages to `[{target_tag}]`."
         )

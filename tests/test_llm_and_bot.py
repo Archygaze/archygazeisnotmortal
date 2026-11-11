@@ -166,6 +166,7 @@ async def test_bot_auto_replies_and_coalesces_messages(tmp_path: Path) -> None:
         assert "CURRENT REPLY TARGET" in call_kwargs["system_prompt"]
         assert "`[Alex]` (user_id: 42, role: friend/member)" in call_kwargs["system_prompt"]
         assert "NOT special_person" in call_kwargs["system_prompt"]
+        assert "Match the exact language" in call_kwargs["system_prompt"]
         msg1.reply.assert_not_awaited()
         msg2.reply.assert_awaited_once_with("yeah im down in 10", mention_author=False)
     finally:
