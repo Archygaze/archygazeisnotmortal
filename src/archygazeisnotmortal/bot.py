@@ -258,7 +258,10 @@ class PersonaBot(commands.Bot):
                     channel_id=channel_id,
                     limit=self.settings.memory_window,
                 )
-                formatted = format_messages_for_llm(recent)
+                formatted = format_messages_for_llm(
+                    recent,
+                    special_user_ids=self.settings.special_user_ids,
+                )
                 if not formatted or formatted[-1]["role"] != "user":
                     return
 
@@ -496,10 +499,13 @@ class PersonaBot(commands.Bot):
         async def ask(interaction: discord.Interaction, message: str) -> None:
             await interaction.response.defer(thinking=True)
             try:
+                speaker = interaction.user.display_name
+                if interaction.user.id in self.settings.special_user_ids:
+                    speaker = f"{speaker} (special_person)"
                 prompt_msg = [
                     {
                         "role": "user",
-                        "content": f"[{interaction.user.display_name}]: {message.strip()}",
+                        "content": f"[{speaker}]: {message.strip()}",
                     }
                 ]
                 bot_names = (self.user.display_name, self.user.name) if self.user else ()

@@ -73,9 +73,9 @@ def test_format_messages_for_llm_coalesces_turns_and_drops_leading_assistant() -
         ChatMessage(4, 1, "assistant", 99, "Me", "nm just chilling", "t4"),
         ChatMessage(5, 1, "user", 1, "Alex", "hop on", "t5"),
     ]
-    formatted = format_messages_for_llm(msgs)
+    formatted = format_messages_for_llm(msgs, special_user_ids=(2,))
     assert formatted == [
-        {"role": "user", "content": "[Alex]: yo\n[Sam]: sup guys"},
+        {"role": "user", "content": "[Alex]: yo\n[Sam (special_person)]: sup guys"},
         {"role": "assistant", "content": "nm just chilling"},
         {"role": "user", "content": "[Alex]: hop on"},
     ]

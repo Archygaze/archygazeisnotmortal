@@ -77,12 +77,12 @@ def test_settings_invalid_channel_id_raises(tmp_path: Path, monkeypatch: pytest.
 
 
 def test_settings_privacy_options(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    for var in ("MEMORY_TTL_HOURS", "PERSONA_CONTENT", "PORT", "HEALTH_PORT"):
+    for var in ("MEMORY_TTL_HOURS", "PERSONA_CONTENT", "PORT", "HEALTH_PORT", "SPECIAL_USER_IDS"):
         monkeypatch.delenv(var, raising=False)
 
     env_file = tmp_path / ".env"
     env_file.write_text(
-        "MEMORY_TTL_HOURS=12.5\nPERSONA_CONTENT=Name: archy\nPORT=8080\n",
+        "MEMORY_TTL_HOURS=12.5\nPERSONA_CONTENT=Name: archy\nPORT=8080\nSPECIAL_USER_IDS=42, 99\n",
         encoding="utf-8",
     )
 
@@ -90,6 +90,7 @@ def test_settings_privacy_options(tmp_path: Path, monkeypatch: pytest.MonkeyPatc
     assert settings.memory_ttl_hours == 12.5
     assert settings.persona_content == "Name: archy"
     assert settings.health_port == 8080
+    assert settings.special_user_ids == (42, 99)
 
     bad_env = tmp_path / ".env.bad"
     bad_env.write_text("MEMORY_TTL_HOURS=-1\n", encoding="utf-8")

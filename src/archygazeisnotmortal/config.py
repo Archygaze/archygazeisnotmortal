@@ -80,6 +80,7 @@ class Settings:
     memory_ttl_hours: float = 0.0
     persona_content: str = ""
     health_port: int | None = None
+    special_user_ids: tuple[int, ...] = ()
 
     @classmethod
     def from_env(
@@ -181,6 +182,9 @@ class Settings:
             memory_ttl_hours=memory_ttl_hours,
             persona_content=os.getenv("PERSONA_CONTENT", "").strip(),
             health_port=health_port,
+            special_user_ids=parse_id_set(
+                os.getenv("SPECIAL_USER_IDS"), "SPECIAL_USER_IDS"
+            ),
         )
 
     def api_key_for(self, provider: str) -> str:
