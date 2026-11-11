@@ -101,6 +101,21 @@ class ChatMessage:
     created_at: str
 
 
+@dataclass(frozen=True, slots=True)
+class SavedShareItem:
+    id: int
+    slug: str
+    label: str
+    content: str
+    file_path: str
+    created_at: str
+
+
+def make_share_slug(label: str) -> str:
+    slug = re.sub(r"[^a-z0-9]+", "_", label.strip().lower()).strip("_")
+    return slug[:60] or "item"
+
+
 def format_messages_for_llm(
     messages: list[ChatMessage],
     special_user_ids: tuple[int, ...] = (),
@@ -205,6 +220,15 @@ class MemoryStore:
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 normalized TEXT NOT NULL UNIQUE,
                 rule TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS owner_links (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                slug TEXT NOT NULL UNIQUE,
+                label TEXT NOT NULL,
+                content TEXT NOT NULL DEFAULT '',
+                file_path TEXT NOT NULL DEFAULT '',
                 created_at TEXT NOT NULL
             );
             """
@@ -527,4 +551,109 @@ class MemoryStore:
         cur_r = await self.conn.execute("SELECT COUNT(*) FROM owner_learned_rules")
         rules_count = int((await cur_r.fetchone())[0])
         return samples_count, rules_count
+
+    async def add_share_item(
+        self,
+        label: str,
+        content: str = "",
+        file_path: str = "",
+        slug: str | None = None,
+    ) -> SavedShareItem:
+        clean_label = " ".join(label.split())
+        if not clean_label:
+            raise ValueError("Label cannot be empty.")
+        clean_content = content.strip()
+        clean_file_path = file_path.strip()
+        if not clean_content and not clean_file_path:
+            raise ValueError("Either content/link or file_path must be provided.")
+
+        final_slug = (slug or make_share_slug(clean_label)).lower()
+        now = datetime.now(UTC).isoformat(timespec="microseconds")
+        await self.conn.execute(
+            """
+            INSERT INTO owner_links (slug, label, content, file_path, created_at)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(slug) DO UPDATE SET
+                label = excluded.label,
+                content = excluded.content,
+                file_path = excluded.file_path,
+                created_at = excluded.created_at
+            """,
+            (final_slug, clean_label, clean_content, clean_file_path, now),
+        )
+        await self.conn.commit()
+        cur = await self.conn.execute(
+            "SELECT id, slug, label, content, file_path, created_at FROM owner_links WHERE slug = ?",
+            (final_slug,),
+        )
+        row = await cur.fetchone()
+        assert row is not None
+        return SavedShareItem(
+            id=int(row["id"]),
+            slug=str(row["slug"]),
+            label=str(row["label"]),
+            content=str(row["content"]),
+            file_path=str(row["file_path"]),
+            created_at=str(row["created_at"]),
+        )
+
+    async def list_share_items(self, limit: int = 40) -> list[SavedShareItem]:
+        cur = await self.conn.execute(
+            """
+            SELECT id, slug, label, content, file_path, created_at
+            FROM owner_links
+            ORDER BY id ASC
+            LIMIT ?
+            """,
+            (limit,),
+        )
+        rows = await cur.fetchall()
+        return [
+            SavedShareItem(
+                id=int(row["id"]),
+                slug=str(row["slug"]),
+                label=str(row["label"]),
+                content=str(row["content"]),
+                file_path=str(row["file_path"]),
+                created_at=str(row["created_at"]),
+            )
+            for row in rows
+        ]
+
+    async def remove_share_item(self, name_or_slug: str) -> SavedShareItem | None:
+        cleaned = " ".join(name_or_slug.split()).lower()
+        if not cleaned:
+            return None
+        candidate_slug = make_share_slug(cleaned)
+        cur = await self.conn.execute(
+            """
+            SELECT id, slug, label, content, file_path, created_at
+            FROM owner_links
+            WHERE LOWER(slug) = ? OR LOWER(slug) = ? OR LOWER(label) = ?
+            LIMIT 1
+            """,
+            (cleaned, candidate_slug, cleaned),
+        )
+        row = await cur.fetchone()
+        if row is None:
+            return None
+        item = SavedShareItem(
+            id=int(row["id"]),
+            slug=str(row["slug"]),
+            label=str(row["label"]),
+            content=str(row["content"]),
+            file_path=str(row["file_path"]),
+            created_at=str(row["created_at"]),
+        )
+        await self.conn.execute("DELETE FROM owner_links WHERE id = ?", (item.id,))
+        await self.conn.commit()
+        return item
+
+    async def clear_share_items(self) -> list[SavedShareItem]:
+        items = await self.list_share_items(limit=500)
+        if items:
+            await self.conn.execute("DELETE FROM owner_links")
+            await self.conn.commit()
+            await self.conn.execute("VACUUM")
+        return items
 

@@ -151,3 +151,24 @@ async def test_memory_store_owner_style_and_rules_persist_across_memory_clear(tm
     finally:
         await store.close()
 
+
+async def test_memory_store_share_items(tmp_path: Path) -> None:
+    store = MemoryStore(tmp_path / "share.db")
+    await store.init()
+    try:
+        item = await store.add_share_item(
+            label="Chill Playlist",
+            content="https://open.spotify.com/playlist/123",
+        )
+        assert item.slug == "chill_playlist"
+        items = await store.list_share_items()
+        assert len(items) == 1
+        assert items[0].content == "https://open.spotify.com/playlist/123"
+
+        removed = await store.remove_share_item("Chill Playlist")
+        assert removed is not None
+        assert removed.slug == "chill_playlist"
+        assert await store.list_share_items() == []
+    finally:
+        await store.close()
+

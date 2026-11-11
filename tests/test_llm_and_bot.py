@@ -367,3 +367,75 @@ async def test_bot_learns_owner_style_and_feedback_rules(tmp_path: Path) -> None
     finally:
         await bot.close()
 
+
+async def test_bot_shares_saved_links_attachments_and_song_links(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings = _make_settings(tmp_path, debounce_seconds=0.05)
+    bot = PersonaBot(settings)
+    await bot.memory.init(settings.auto_reply_channel_ids)
+
+    try:
+        bot._connection.user = SimpleNamespace(id=999, name="Clone", display_name="Clone")  # type: ignore[attr-defined]
+        bot.media_dir.mkdir(parents=True, exist_ok=True)
+        pic_path = bot.media_dir / "meme_pic.png"
+        pic_path.write_bytes(b"fake-png")
+
+        await bot.memory.add_share_item(
+            label="chill playlist",
+            content="https://open.spotify.com/playlist/xyz",
+        )
+        await bot.memory.add_share_item(
+            label="meme pic",
+            file_path=str(pic_path),
+        )
+
+        async def fake_lookup(query: str) -> str | None:
+            return "https://youtu.be/_AWIqXzvX-U"
+
+        monkeypatch.setattr("archygazeisnotmortal.media.lookup_music_link", fake_lookup)
+
+        bot.llm.generate_reply = AsyncMock(  # type: ignore[method-assign]
+            return_value="try this [[song_link: Aphex Twin - Rhubarb]] [[send:meme_pic]]"
+        )
+
+        class DummyTyping:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                return False
+
+        channel = MagicMock()
+        channel.id = 555
+        channel.typing = MagicMock(return_value=DummyTyping())
+        channel.send = AsyncMock()
+
+        friend = SimpleNamespace(id=456, bot=False, display_name="Friend")
+        msg = SimpleNamespace(
+            author=friend,
+            channel=channel,
+            type=discord.MessageType.default,
+            content="im having headaches again, send a song link",
+            attachments=[],
+            mentions=[],
+            reference=None,
+            reply=AsyncMock(),
+        )
+
+        await bot.on_message(msg)  # type: ignore[arg-type]
+        await bot._debounce_tasks[555]
+
+        sys_prompt = bot.llm.generate_reply.await_args.kwargs["system_prompt"]
+        assert "OWNER'S SAVED LINKS & MEDIA" in sys_prompt
+        assert "https://open.spotify.com/playlist/xyz" in sys_prompt
+        assert "Reply STRICTLY in natural English" in sys_prompt
+
+        reply_call = msg.reply.await_args
+        assert reply_call.args == ("try this https://youtu.be/_AWIqXzvX-U",)
+        assert reply_call.kwargs["mention_author"] is False
+        assert len(reply_call.kwargs["files"]) == 1
+        assert reply_call.kwargs["files"][0].filename == "meme_pic.png"
+    finally:
+        await bot.close()
+

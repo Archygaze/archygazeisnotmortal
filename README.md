@@ -56,6 +56,8 @@ uv run archygazeisnotmortal
 - `/style_sync [channel] [limit]` — Scan recent messages from `OWNER_USER_IDS` to learn your texting voice
 - `/style_add <example>` — Manually save a short sample line of how you talk
 - `/style_list` / `/style_clear` — Inspect or clear saved voice samples and learned rules
+- `/share_add <label> [link_or_text] [file]` — Save a playlist link, URL, or media file (up to 8 MB) for the bot to share
+- `/share_list` / `/share_remove <name>` — List or delete saved links and media files
 - `/bot_pause` / `/bot_resume` — Pause or resume auto-replies
 - `/bot_status` — Check active provider, fallback, and channels
 - `/ask <message>` — Send a one-off message to your persona in any channel

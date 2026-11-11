@@ -5,6 +5,7 @@ import logging
 import time
 from collections import defaultdict
 from collections.abc import Sequence
+from pathlib import Path
 
 import discord
 from discord import app_commands
@@ -12,11 +13,19 @@ from discord.ext import commands
 
 from archygazeisnotmortal.config import Settings
 from archygazeisnotmortal.llm import LLMClient
+from archygazeisnotmortal.media import (
+    MAX_SHARE_ATTACHMENT_BYTES,
+    detect_obvious_language,
+    resolve_reply_media,
+    sanitize_media_filename,
+)
 from archygazeisnotmortal.memory import (
     MemoryStore,
+    SavedShareItem,
     clean_style_sample,
     format_messages_for_llm,
     is_owner_correction_feedback,
+    make_share_slug,
 )
 from archygazeisnotmortal.persona import load_persona
 
@@ -75,6 +84,7 @@ class PersonaBot(commands.Bot):
         super().__init__(command_prefix="!", intents=intents, help_command=None)
 
         self.settings = settings
+        self.media_dir = (settings.database_path.parent / "media").resolve()
         self.memory = MemoryStore(
             db_path=settings.database_path,
             max_history_per_channel=settings.memory_window,
@@ -178,6 +188,8 @@ class PersonaBot(commands.Bot):
         display_name: str,
         style_samples: Sequence[str] = (),
         learned_rules: Sequence[str] = (),
+        saved_items: Sequence[SavedShareItem] = (),
+        latest_text: str = "",
     ) -> str:
         clean_name = (display_name or "User").strip()
         if user_id in self.settings.special_user_ids:
@@ -211,12 +223,44 @@ class PersonaBot(commands.Bot):
                 "Explicit feedback and rules taught by the owner (follow these strictly, overriding conflicting habits above):\n"
                 f"{rule_lines}"
             )
+        if saved_items:
+            item_lines: list[str] = []
+            for item in saved_items:
+                if item.file_path and item.content:
+                    item_lines.append(
+                        f"- \"{item.label}\": {item.content} (also attach saved file with [[send:{item.slug}]])"
+                    )
+                elif item.file_path:
+                    item_lines.append(
+                        f"- \"{item.label}\" (saved file) -> include [[send:{item.slug}]] to attach it"
+                    )
+                else:
+                    item_lines.append(f"- \"{item.label}\" -> {item.content}")
+            sections.append(
+                "--- OWNER'S SAVED LINKS & MEDIA ---\n"
+                "Real links, playlists, and media files saved by the owner to share when relevant:\n"
+                + "\n".join(item_lines)
+            )
+        sections.append(
+            "--- LINK & SONG SHARING RULES ---\n"
+            "- NEVER invent, guess, or fake a URL, and NEVER stall with \"wait a sec\" / \"bentar ya\" promising a link without including it right now.\n"
+            "- If a matching item exists in OWNER'S SAVED LINKS & MEDIA above, paste its exact URL verbatim or include `[[send:slug]]` to attach the saved file.\n"
+            "- When someone asks for a song/playlist recommendation link and no saved playlist/link matches, write `[[song_link: Artist - Song Title]]` (max 3 per reply) — the bot replaces it automatically with a real playable YouTube/Apple Music link."
+        )
+
+        detected_lang = detect_obvious_language(latest_text) if latest_text else None
+        lang_instruction = (
+            f"CRITICAL LANGUAGE RULE: The latest message from `[{target_tag}]` is in {detected_lang}. "
+            f"Reply STRICTLY in natural {detected_lang} (do NOT mix in words from another language)."
+            if detected_lang
+            else f"Match the exact language of `[{target_tag}]`'s latest message (e.g., if they just wrote in English, reply in English; if Indonesian, reply in Indonesian), even if earlier messages used a different language."
+        )
         sections.append(
             "--- CURRENT REPLY TARGET ---\n"
             f"You are replying specifically to the latest message from `[{target_tag}]` "
             f"(user_id: {user_id}, role: {target_role}).\n"
             f"{role_note}\n"
-            f"Match the exact language of `[{target_tag}]`'s latest message (e.g., if they just wrote in English, reply in English; if Indonesian, reply in Indonesian), even if earlier messages used a different language.\n"
+            f"{lang_instruction}\n"
             f"Keep speakers strictly separate: NEVER treat `[{target_tag}]` as another speaker "
             f"or attribute another speaker's messages to `[{target_tag}]`."
         )
@@ -362,38 +406,75 @@ class PersonaBot(commands.Bot):
                 )
                 style_samples = await self.memory.get_style_samples(limit=20)
                 learned_rules = await self.memory.get_learned_rules(limit=20)
+                saved_items = await self.memory.list_share_items(limit=40)
                 turn_system_prompt = self._build_turn_system_prompt(
                     user_id=trigger_msg.author.id,
                     display_name=trigger_msg.author.display_name,
                     style_samples=style_samples,
                     learned_rules=learned_rules,
+                    saved_items=saved_items,
+                    latest_text=trigger_msg.content or "",
                 )
 
                 async with trigger_msg.channel.typing():
-                    reply_text = await self.llm.generate_reply(
+                    raw_reply_text = await self.llm.generate_reply(
                         system_prompt=turn_system_prompt,
                         messages=formatted,
                         bot_names=bot_names,
                     )
+                    reply_text, attachment_paths = await resolve_reply_media(
+                        raw_reply_text,
+                        saved_items=saved_items,
+                        media_dir=self.media_dir,
+                    )
+
+                if not reply_text and not attachment_paths:
+                    return
+
+                stored_text = reply_text
+                if attachment_paths:
+                    attach_note = f"[attached: {', '.join(p.name for p in attachment_paths)}]"
+                    stored_text = f"{reply_text}\n{attach_note}".strip() if reply_text else attach_note
 
                 await self.memory.add_message(
                     channel_id=channel_id,
                     role="assistant",
-                    content=reply_text,
+                    content=stored_text,
                     author_id=self.user.id if self.user else None,
                     author_name=self.user.display_name if self.user else "Bot",
                 )
                 self._last_reply_at[channel_id] = time.monotonic()
 
                 chunks = split_discord_message(reply_text)
-                for i, chunk in enumerate(chunks):
-                    if i == 0 and not is_dm:
+                if not chunks and attachment_paths:
+                    if not is_dm:
                         try:
-                            await trigger_msg.reply(chunk, mention_author=False)
-                            continue
+                            await trigger_msg.reply(
+                                files=[discord.File(p) for p in attachment_paths],
+                                mention_author=False,
+                            )
+                            return
                         except discord.HTTPException:
                             pass
-                    await trigger_msg.channel.send(chunk)
+                    await trigger_msg.channel.send(
+                        files=[discord.File(p) for p in attachment_paths]
+                    )
+                    return
+
+                for i, chunk in enumerate(chunks):
+                    files_kw = (
+                        {"files": [discord.File(p) for p in attachment_paths]}
+                        if i == 0 and attachment_paths
+                        else {}
+                    )
+                    if i == 0 and not is_dm:
+                        try:
+                            await trigger_msg.reply(chunk, mention_author=False, **files_kw)
+                            continue
+                        except discord.HTTPException:
+                            if files_kw:
+                                files_kw = {"files": [discord.File(p) for p in attachment_paths]}
+                    await trigger_msg.channel.send(chunk, **files_kw)
 
         except asyncio.CancelledError:
             if self._debounce_tasks.get(channel_id) is current_task:
@@ -759,6 +840,137 @@ class PersonaBot(commands.Bot):
             )
 
         @self.tree.command(
+            name="share_add",
+            description="Save a link, playlist, or file so the bot can share it in chat.",
+        )
+        @app_commands.describe(
+            label="What this is (e.g. 'chill playlist', 'aphex twin pic', 'letterboxd')",
+            link_or_text="URL or text snippet to share",
+            file="Optional image/GIF/audio/video file (up to 8 MB) to attach when shared",
+        )
+        async def share_add(
+            interaction: discord.Interaction,
+            label: str,
+            link_or_text: str | None = None,
+            file: discord.Attachment | None = None,
+        ) -> None:
+            if not self._is_admin(interaction):
+                await interaction.response.send_message(
+                    "You are not authorized to run admin commands.", ephemeral=True
+                )
+                return
+            clean_label = " ".join(label.split())
+            clean_content = (link_or_text or "").strip()
+            if not clean_label:
+                await interaction.response.send_message("Label cannot be empty.", ephemeral=True)
+                return
+            if not clean_content and file is None:
+                await interaction.response.send_message(
+                    "Provide a `link_or_text` URL/message or attach a `file`.", ephemeral=True
+                )
+                return
+
+            saved_path_str = ""
+            if file is not None:
+                if file.size > MAX_SHARE_ATTACHMENT_BYTES:
+                    await interaction.response.send_message(
+                        "Attached file is too large (max 8 MB).", ephemeral=True
+                    )
+                    return
+                await interaction.response.defer(thinking=True, ephemeral=True)
+                slug = make_share_slug(clean_label)
+                self.media_dir.mkdir(parents=True, exist_ok=True)
+                dest = (self.media_dir / sanitize_media_filename(file.filename, slug)).resolve()
+                if not dest.is_relative_to(self.media_dir):
+                    await interaction.followup.send("Invalid filename.", ephemeral=True)
+                    return
+                await file.save(dest)
+                saved_path_str = str(dest)
+                item = await self.memory.add_share_item(
+                    label=clean_label,
+                    content=clean_content,
+                    file_path=saved_path_str,
+                    slug=slug,
+                )
+                await interaction.followup.send(
+                    f"Saved `{item.label}` (id: `{item.slug}`) with attachment `{dest.name}`.",
+                    ephemeral=True,
+                )
+                return
+
+            item = await self.memory.add_share_item(label=clean_label, content=clean_content)
+            await interaction.response.send_message(
+                f"Saved `{item.label}` -> `{item.content}`", ephemeral=True
+            )
+
+        @self.tree.command(
+            name="share_list",
+            description="List saved links, playlists, and media files.",
+        )
+        async def share_list(interaction: discord.Interaction) -> None:
+            if not self._is_admin(interaction):
+                await interaction.response.send_message(
+                    "You are not authorized to run admin commands.", ephemeral=True
+                )
+                return
+            items = await self.memory.list_share_items(limit=40)
+            if not items:
+                await interaction.response.send_message(
+                    "No saved links or files yet. Use `/share_add` to add playlists, links, or pics.",
+                    ephemeral=True,
+                )
+                return
+            lines: list[str] = []
+            for item in items:
+                parts = []
+                if item.content:
+                    parts.append(item.content)
+                if item.file_path:
+                    parts.append(f"[file: {Path(item.file_path).name}]")
+                lines.append(f"- **{item.label}** (`{item.slug}`): {' '.join(parts)}")
+            body = "**Saved Links & Media:**\n" + "\n".join(lines)
+            if len(body) > 1950:
+                body = body[:1947] + "..."
+            await interaction.response.send_message(body, ephemeral=True)
+
+        @self.tree.command(
+            name="share_remove",
+            description="Delete a saved link/file by label or id (or 'all' to clear everything).",
+        )
+        @app_commands.describe(name="Saved label or slug to remove, or 'all'")
+        async def share_remove(interaction: discord.Interaction, name: str) -> None:
+            if not self._is_admin(interaction):
+                await interaction.response.send_message(
+                    "You are not authorized to run admin commands.", ephemeral=True
+                )
+                return
+            if name.strip().lower() == "all":
+                removed = await self.memory.clear_share_items()
+                for item in removed:
+                    if item.file_path:
+                        p = Path(item.file_path).resolve()
+                        if p.is_relative_to(self.media_dir) and p.is_file():
+                            p.unlink(missing_ok=True)
+                await interaction.response.send_message(
+                    f"Removed {len(removed)} saved link/media item(s).", ephemeral=True
+                )
+                return
+
+            removed_item = await self.memory.remove_share_item(name)
+            if removed_item is None:
+                await interaction.response.send_message(
+                    f"No saved item matched `{name}`.", ephemeral=True
+                )
+                return
+            if removed_item.file_path:
+                p = Path(removed_item.file_path).resolve()
+                if p.is_relative_to(self.media_dir) and p.is_file():
+                    p.unlink(missing_ok=True)
+            await interaction.response.send_message(
+                f"Removed `{removed_item.label}`.", ephemeral=True
+            )
+
+        @self.tree.command(
             name="ask", description="Send a one-off message to the persona in any channel."
         )
         @app_commands.describe(message="What you want to say")
@@ -778,23 +990,41 @@ class PersonaBot(commands.Bot):
                 ]
                 style_samples = await self.memory.get_style_samples(limit=20)
                 learned_rules = await self.memory.get_learned_rules(limit=20)
+                saved_items = await self.memory.list_share_items(limit=40)
                 turn_system_prompt = self._build_turn_system_prompt(
                     user_id=interaction.user.id,
                     display_name=interaction.user.display_name,
                     style_samples=style_samples,
                     learned_rules=learned_rules,
+                    saved_items=saved_items,
+                    latest_text=message.strip(),
                 )
                 bot_names = (self.user.display_name, self.user.name) if self.user else ()
-                reply_text = await self.llm.generate_reply(
+                raw_reply = await self.llm.generate_reply(
                     system_prompt=turn_system_prompt,
                     messages=prompt_msg,
                     bot_names=bot_names,
                 )
+                reply_text, attachment_paths = await resolve_reply_media(
+                    raw_reply,
+                    saved_items=saved_items,
+                    media_dir=self.media_dir,
+                )
                 chunks = split_discord_message(reply_text)
+                if not chunks and attachment_paths:
+                    await interaction.followup.send(
+                        files=[discord.File(p) for p in attachment_paths]
+                    )
+                    return
                 if not chunks:
                     await interaction.followup.send("...")
                     return
-                await interaction.followup.send(chunks[0])
+                if attachment_paths:
+                    await interaction.followup.send(
+                        chunks[0], files=[discord.File(p) for p in attachment_paths]
+                    )
+                else:
+                    await interaction.followup.send(chunks[0])
                 for extra in chunks[1:]:
                     await interaction.followup.send(extra)
             except Exception as exc:
